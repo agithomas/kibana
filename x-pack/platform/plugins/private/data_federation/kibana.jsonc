@@ -22,6 +22,7 @@
       "licenseApiGuard"
     ],
     "optionalPlugins": [
+      "agentBuilder",
       "cloud",
       "share",
       "usageCollection"

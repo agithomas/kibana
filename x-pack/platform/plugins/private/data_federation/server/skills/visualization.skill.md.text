@@ -1,0 +1,283 @@
+# FDS visualisation creation
+
+Build standalone Lens charts, or one Kibana dashboard, on an **FDS dataset**
+(`FROM <dataset>`). An FDS dataset is not an Elasticsearch index. Do not create
+an index, ingest pipeline, or data view.
+
+The field names below are placeholders. Substitute the dataset name, the mapped
+date field, and columns you confirmed. Do not invent a vendor, a product, or a
+log format. Prior knowledge is not evidence.
+
+## Two paths
+
+- **Dashboard (default).** The user asked for a dashboard, set `DASHBOARD_TITLE`, or did not specify what they want. When the intent is ambiguous, default to a dashboard. Follow Steps 1–3, then Step 6. Do not call `platform.core.create_visualization`. Load the built-in `dashboards` skill and create the dashboard in one `platform.dashboard.generate_dashboard` call.
+- **Standalone chart.** The user explicitly asked for a single chart, one metric, one trend, or one breakdown — not a dashboard. Follow Steps 1–3, then Steps 4–5 and persist each chart with `platform.core.create_visualization`.
+
+## Recognised inputs
+
+The user may supply some or all of these as `KEY: value` lines, a structured
+block, or natural language. Parse them when present. Leave unknown inputs
+unknown — do not guess or fill in defaults.
+
+| Input | Used in | Meaning |
+|---|---|---|
+| `DATASET` | Step 1a | The `_query/dataset` name, e.g. `vpc_flow_ui` |
+| `FORMAT` | Step 1a | Expected file format: `parquet`, `ndjson`, `csv`, or `tsv` |
+| `SOURCE_TYPE` | Step 2 | What the data is, e.g. "AWS VPC Flow Logs" |
+| `SAMPLE_START` | Step 1b | ISO start of the bounded sample window |
+| `SAMPLE_END` | Step 1b | ISO end of the bounded sample window |
+| `DASHBOARD_TITLE` | Step 2/6 | Title for the dashboard |
+| `MAX_VISIBLE_PANELS` | Step 3/6 | Suggested cap for the always-visible summary tier (default 8). Detail sections are uncapped. |
+| `FIELD_NOTES` | Step 2 | Column meanings, sentinel values, and "no data" tokens |
+
+When `FIELD_NOTES` is given, treat it as the confirmed column meanings and the
+only "no data" values. Do not add any — including NULL — that the user did not
+list. Do not ask the user to re-confirm what they already stated. Step 2
+(Confirm inputs) takes the expert path.
+
+When `SOURCE_TYPE` is given, check that the sample columns fit it. If they do
+not, tell the user and wait.
+
+When `FORMAT` is given, check that the detected format from the resource
+extension or `settings.format` matches it. If it does not, tell the user and
+wait.
+
+`MAX_VISIBLE_PANELS` (default 8) is a guideline, not a hard cap. It limits
+panels in the **summary tier** (top-level `add_panels`) because every
+summary panel fires an S3 query on dashboard open. Detail sections are
+uncapped — their queries fire only when the user expands them. Let the data
+drive the panel count: include as many panels as are valuable, but keep the
+summary tier lean. The markdown header does not count. A standalone-chart
+request creates at most `MAX_VISIBLE_PANELS` charts.
+
+## When to use this skill
+
+Use this skill when:
+
+- The user asks for a chart, metric, trend, breakdown, or distribution of an FDS dataset.
+- The user names a dataset, `_query/dataset`, or federated Parquet, NDJSON, CSV, or TSV files, and wants a visualisation or visualization.
+- The user wants a Kibana dashboard on an FDS dataset.
+- The user wants to update an existing FDS visualization by attachment id.
+
+Do **not** use this skill when:
+
+- The data is an Elasticsearch index, data stream, or alias. Use visualization-creation.
+- The user wants raw documents or a Discover table.
+- The user has not confirmed which dataset to chart and more than one dataset exists. Ask first.
+
+## Available tools
+
+- **platform.core.list_indices**: Find datasets. Read the `datasets` entries (name and resource). Ignore index results for this skill.
+- **platform.core.execute_workflow**: Read `GET /_query/dataset/<name>` so you learn `partition_spec` and the date mapping. The `elasticsearch.request` step asks the user to approve a read-only GET. Tell them that and wait.
+- **platform.core.execute_esql**: Sample and profile one bounded window. Every call must set `query` to the full ES|QL text.
+- **platform.core.create_visualization**: Persist a Lens attachment. Always pass `index`, `target.esql`, `target.type: "lens"`, `target.chartType`, and an absolute `time_range`.
+
+Do not call `platform.core.generate_esql`, `platform.core.get_index_mapping`, or `platform.core.search` on a dataset. They look up an index and fail or time out on FDS.
+
+The reference documents `esql-recipes` and `formats` are already loaded with this skill. Do not call `read_file` to read them — their content is already in your context. Likewise, a `screen-context` attachment is not needed for this workflow. If any tool call returns a schema-validation error (missing required parameter), do not retry the same tool — the parameters are not reaching the tool. Move on with the information you already have.
+
+Every `platform.core.execute_esql` call must set `query` to the full ES|QL text. Never call it with empty or missing parameters. Every `platform.core.create_visualization` call must set `query`, `index`, `target`, and `time_range`. If you cannot populate a required parameter, skip the call and say why.
+
+One tool call at a time. Wait for the result. If a call fails, read the error, fix that one query, and retry it once. Do not repeat a failed call unchanged. If the same tool fails twice with the same error class, stop calling it and proceed with what you have.
+
+## 1. Discover and sample
+
+Run all read-only work in one pass before asking the user anything (apart from the workflow approval dialog). Do not wait between sub-steps.
+
+### 1a. Dataset definition
+
+If the user did not name a dataset, call `platform.core.list_indices` once and show the `datasets` entries. Ask which one to use and wait.
+
+Then call `platform.core.execute_workflow` once with this YAML, replacing `<name>`:
+
+```yaml
+version: "1"
+name: get_dataset_definition
+enabled: true
+triggers:
+  - type: manual
+steps:
+  - name: get_dataset
+    type: elasticsearch.request
+    with:
+      method: GET
+      path: /_query/dataset/<name>
+```
+
+If the tool is unavailable, the license blocks it, or the user declines the approval, ask them to paste `GET /_query/dataset/<name>`. If they decline that too, continue from the `list_indices` resource and say that `partition_spec` and mappings are unknown.
+
+Record:
+
+- File format. Use `settings.format` when it is `parquet`, `ndjson`, `csv`, or `tsv`. Otherwise take it from the resource extension, ignoring a trailing `.gz`, `.gzip`, `.zst`, or `.zstd`: `.parquet` or `.parq` is Parquet; `.ndjson`, `.jsonl`, or `.json` is NDJSON; `.csv` is CSV; `.tsv` is TSV. If the pattern matches more than one of those, stop and say so. Read `formats` for the table.
+- `schema_resolution` when present.
+- For CSV or TSV: `header_row`, `delimiter`, and `null_value`. For NDJSON: `schema_sample_size` when set.
+- Partition folders in the glob (`year`, `month`, `day`, `hour`, or others) and `partition_spec` when known.
+- The date field from mappings (`type: date`, its `path` and `format`). Queries use the mapped field name, not the path. This skill expects that name to be `@timestamp`. If mappings are unknown, find the date column in the sample and ask the user to confirm it. Do not build a time chart without one.
+
+Then branch:
+
+- **Parquet.** Types come from file metadata. Treat them as authoritative.
+- **NDJSON, CSV, and TSV.** Types come from a sample. Treat them as provisional: a sparse column can be missing, and `union_by_name` widens incompatible types to `keyword`.
+
+If the time column is not mapped as `date`, stop. A date type is a dataset `mappings` entry (`type: date`, `path`, and `format`), not a chart query. Hand that to whoever registers the dataset. Do not wrap the column in `TO_DATETIME` and continue: `partition_spec` and the time picker both need a date-typed `@timestamp`.
+
+### 1b. Find the sample window
+
+If `SAMPLE_START` and `SAMPLE_END` are given, use them. If they span more than one partition (one hour when the glob or `partition_spec` has `hour`, otherwise one day), tell the user and ask before running.
+
+If `SAMPLE_START` is not given, probe for the latest partition that has data. Pick a window matching the finest partition unit. Probe with `LIMIT 1`:
+
+```esql
+FROM <dataset>
+| WHERE @timestamp >= TO_DATETIME("<start>") AND @timestamp < TO_DATETIME("<end>")
+| LIMIT 1
+```
+
+If 0 rows, step backward by one partition unit and retry. Try at most 3 windows. If all return 0 rows, ask for a range that has data. Do not widen the window.
+
+### 1c. Sample and profile
+
+Never run `FROM <dataset>` without a time bound. Use the window from 1b. Sampling uses literal bounds, not `?_tstart`. Run one call each:
+
+1. `LIMIT 20` sample to see columns and example values.
+2. One profile query: `STATS rows = COUNT(*), <col>_nulls = COUNT(*) - COUNT(<col>), <col>_distinct = COUNT_DISTINCT(<col>)` for every column except `@timestamp` and partition columns.
+3. For up to 6 low-cardinality columns (`<col>_distinct` at most 20), one frequent-values query each: `EVAL v = <col> | STATS n = COUNT(*) BY v | SORT n DESC | LIMIT 10`.
+
+Do not assume a numeric-looking NDJSON, CSV, or TSV column is a number. Cast with `TO_LONG` or `TO_DOUBLE` before aggregating. CSV or TSV with `header_row: false` names columns `col0`, `col1`, etc. CSV and TSV treat `NA`, `NULL`, and `-` as literal strings unless `null_value` is set.
+
+## 2. Confirm inputs
+
+All read-only discovery is done. Show the user a summary, then branch.
+
+**Expert path** (`FIELD_NOTES` provided): list each input as `- KEY: value` (DATASET, FORMAT, SOURCE_TYPE, SAMPLE window and row count, DASHBOARD_TITLE defaulting to dataset name title-cased, MAX_VISIBLE_PANELS defaulting to 8, FIELD_NOTES as given). Add: `To override any value, reply with - KEY: new value`. Do not re-ask column meanings. On approval continue to Step 3 (plan panels).
+
+**Guided path** (`FIELD_NOTES` not provided): list the discovered inputs (DATASET, FORMAT, SAMPLE, DASHBOARD_TITLE, MAX_VISIBLE_PANELS) followed by the column profile table (column, type, nulls, distinct, top values). Then ask for SOURCE_TYPE and FIELD_NOTES. Add the override hint. Wait for the answer. Do not propose charts or a dashboard until FIELD_NOTES is confirmed.
+
+**Overrides**: accept "proceed", "looks good", "go", "yes", "approve", or overrides as `- KEY: new value`. Merge overrides and re-present the summary. On confirmation lock the inputs and continue.
+
+## 3. Plan panels
+
+Classify each confirmed column (excluding `@timestamp` and partition columns) using the profile from Step 1c:
+
+| Profile | Chart rule |
+|---|---|
+| `distinct = 1` | Constant — mention in description, do not chart |
+| `distinct 2–10`, categorical | Breakdown: `pie` (donut), or color split on a time series |
+| `distinct 11–100` | Top-N `xy` horizontal bar (`SORT … DESC | LIMIT 10`) |
+| `distinct > 100` | Top-N bar; never use as a breakdown dimension |
+| Numeric, nulls < 50% | Measure: `metric` (SUM/AVG/COUNT_DISTINCT) and/or time series |
+| Nulls ≥ 90% or type unknown | Skip — note in the data-notes markdown |
+
+**After excluding "no data" tokens**, re-evaluate distinct counts. If a categorical column has only 1 remaining real value, skip the breakdown and mention the value in the dashboard description.
+
+**Derived metrics.** If two columns could yield a useful derived value (e.g. `end − start` = flow duration), suggest it to the user. If the user did not confirm the semantics, list the suggestion but do not chart it.
+
+Build a panel list: for each panel note the title, `chartType`, primary column(s), and which heuristic row drove the choice. The list does not need separate approval when the user already said "go" / "proceed" — execute it. Show the panel list in your response alongside the rendered result so the user can see the rationale.
+
+## 4. Standalone charts
+
+Skip this step when the user asked for a dashboard or set `DASHBOARD_TITLE`. Use Step 6 instead. Do not create visualization attachments and then place them on a dashboard.
+
+Propose each chart before calling `platform.core.create_visualization`: title, `chartType` (`metric`, `xy`, `pie`, or `data_table`), and one final ES|QL query. Wait for approval only when the user has not already specified or pre-approved the charts. When the user lists specific charts, says "proceed", "go ahead", "create all", or gives a count like "create up to 8 charts", treat that as blanket approval — do not ask for confirmation on each chart. Propose once, then build all in sequence. Use `MAX_VISIBLE_PANELS` as a guideline — include as many charts as the data warrants, but standalone charts all fire on load so keep the set lean.
+
+Then call `platform.core.create_visualization` once per chart. Resolve the dataset once and reuse it.
+
+Required arguments:
+
+- `query`: the natural-language description of the chart.
+- `index`: the dataset name, for example `vpc_flow_ui`. Omitting it makes the tool look for an index and fail.
+- `time_range`: absolute ISO start and end of the window that returned rows, for example `{ "from": "2026-10-25T12:00:00.000Z", "to": "2026-10-25T13:00:00.000Z" }`. Do not omit it. The tool's default probes the dataset with a Lucene search and leaves the chart with no time range.
+- `target`:
+
+```json
+{
+  "type": "lens",
+  "chartType": "metric",
+  "esql": "FROM <dataset> | KEEP @timestamp | WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend | STATS `Total` = COUNT(*)"
+}
+```
+
+`target.type` is `lens`. Do not use `custom_content`: its template resolver samples the query and times out on FDS. Do not use `vega` until a Lens chart has been shown to work for this dataset.
+
+`target.esql` is required. Write it yourself from the approved query. Do not omit it so the tool generates ES|QL: generation discovers an index and fails with "No resource found".
+
+Copy recipes from `esql-recipes` and the format traps from `formats`. Substitute the dataset, columns, and "no data" filters.
+
+After the call, compare `data.esql` (or the stored query in the tool result) with the ES|QL you passed. If the tool regenerated a different query, the provided query failed validation. Fix that query and retry once. Do not accept a regenerated index query.
+
+Save `data.attachment_id` and `data.version`. If `attachment_id` is missing, persistence failed.
+
+To update a chart, call the tool again with `target.type: "attachment"`, the same `attachment_id`, a new `esql`, the dataset `index`, and the absolute `time_range`.
+
+## 5. ES|QL rules for every chart
+
+- `FROM <dataset>`, then `KEEP` only the columns that chart uses, then `WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend`.
+- Do not filter on partition columns (`year`, `month`, `day`, `hour`). Pruning comes from `@timestamp`.
+- Do not `EVAL` or rename `@timestamp`.
+- **In `execute_esql`** (sampling): a time chart groups with `BUCKET(@timestamp, 100, ?_tstart, ?_tend)`.
+- **In `create_visualization` only:** `BUCKET()` fails on FDS datasets — the tool's column-probe cannot resolve it. Use `DATE_TRUNC(<interval>, @timestamp)` and `data_table`. Pick the interval from the window width (1 minute for 1 hour, 5 minutes for multi-hour, 1 hour for a day). Add `LIMIT 1000`. Do not use this form on a dashboard.
+- **In `platform.dashboard.generate_dashboard`:** time series are `xy` charts. Group with `` STATS `Flows` = COUNT(*) BY `Time` = BUCKET(@timestamp, 100, ?_tstart, ?_tend) ``. Pass that query in the panel `esql` field. `BUCKET` works on this path. Do not substitute `DATE_TRUNC` tables.
+- `EVAL` an alias before `STATS BY`, and group by the alias.
+- Quote a metric alias with backticks: `STATS `Total Flows` = COUNT(*)`. Double quotes are a syntax error.
+- Exclude agreed "no data" values from counts, distinct counts, sums, and top-N charts. Exclude NULL only from a column the chart groups or sums. On CSV or TSV with no `null_value`, exclude the agreed token with `!=`, not `IS NULL`.
+- On NDJSON, CSV, or TSV, cast a keyword numeric before aggregating it: `EVAL b = TO_DOUBLE(bytes)`. A Parquet numeric column does not need that cast.
+- A nested NDJSON or Parquet field is a dotted name, such as `user.id`. Quote it with backticks: `` `user.id` ``.
+- Ratios: `EVAL hit = CASE(<condition>, 1, 0) | STATS rate = ROUND(100.0 * SUM(hit) / COUNT(*), 2)`.
+- Top-N charts use `SORT` and `LIMIT 10`. Tables use `LIMIT 100`.
+
+## 6. Create the dashboard
+
+Use this step when the user asked for a dashboard or set `DASHBOARD_TITLE`. Do not call `platform.core.create_visualization` first. Do not place panels with `source: "attachment"`.
+
+The built-in `dashboards` skill owns `platform.dashboard.generate_dashboard`. Load it with `load_skill` and `skill: "dashboards"`, then make **one** `platform.dashboard.generate_dashboard` call. This is a new dashboard, not an enhance: do not call `read_file` for the enhance guide.
+
+After `load_skill`, these rules override the dashboards skill:
+
+- **Write the ES|QL yourself and pass it on every data panel as `esql`.** The dashboards skill says not to. On FDS that advice fails: omitting `esql` makes the generator look up an index and return "No resource found". Do not call `platform.core.generate_esql`.
+- **Do not add controls.** Do not call `add_controls`. Controls read an index mapping, and an FDS dataset is not an index.
+- **Do not use `renderer: "custom_content"`.** Its resolver samples the query and times out on FDS.
+- **Set `time_range`** to the absolute window that returned rows. The user named that window. Example: `{ "from": "2026-10-25T12:00:00.000Z", "to": "2026-10-25T13:00:00.000Z" }`.
+
+`operations`, in order:
+
+1. `set_metadata` with `title` (`DASHBOARD_TITLE`, or a title you proposed), `description`, and `time_range`. The description may name an account or interface only when the sample showed a single value for that column. Do not invent one.
+2. `add_panels` for the open summary. Omit `sectionId`. These panels are not wrapped in a section.
+3. One `add_section` per detail group, with that group's `panels` on the section. `add_section` has no collapsed field and saves `collapsed: false`. Do not call `attachments.update` to change that. Sections still separate the summary from the detail.
+
+**Summary tier** (`add_panels`). These panels query S3 on every dashboard open, so keep the tier lean — around `MAX_VISIBLE_PANELS` (default 8), but let the data drive the count. Start with one markdown panel (`source: "config"`, `type: "markdown"`) stating the "no data" rules — it does not count. Then KPI metrics, one breakdown (pie/donut), and the primary time series. Skip a panel whose column or meaning was not confirmed.
+
+**Detail sections** (`add_section`). Queries fire only when the user expands a section — no cost at load time. Add as many panels as the data warrants. Group by topic (e.g. top sources/destinations, ports/protocol, recent rows table). Each section gets its own `add_section` call with `panels`.
+
+Every data panel: `source: "request"`, `renderer: "lens"`, `chartType` (`metric`/`xy`/`pie`/`data_table`), `index` (dataset name), `query` (natural language — say "horizontal bar"/"bar"/"line" for Lens), `esql` (from `esql-recipes`, keep `?_tstart`/`?_tend`).
+
+If `load_skill` for `dashboards` fails, or `generate_dashboard` is unavailable, say so and stop. Do not build the dashboard through `create_visualization`. Ask the user to type `/dashboards`.
+
+## 7. Render
+
+```
+<render_attachment id="{attachment_id}" version="{version}" />
+```
+
+Copy both values from the tool result. Do not invent them. Do not use a `<visualization>` element for this output.
+
+Render a chart the user asked to see. Do not render an intermediate chart they did not ask to inspect. When a dashboard was created, render the dashboard attachment — the individual charts are inside it.
+
+## 8. Edge cases
+
+- **0 rows:** window has no files. Ask for another window.
+- **`Glob pattern discovered too many files`:** `partition_spec` not pruning. Say so.
+- **0 rows on `.gz`/`.zst` text file:** report and stop. Do not change the dataset.
+- **Mixed format in one resource:** ask for one dataset per format.
+- **Column missing (text dataset):** inference did not sample it. Do not invent it.
+- **Tool regenerates ES|QL:** your query failed validation. Fix and retry once.
+- **`BUCKET()` fails in `create_visualization`:** use `DATE_TRUNC` + `data_table`. See Column-probe section.
+- **User wants a dashboard:** do not create visualization attachments. Follow Step 6.
+- **User names an index:** stop and use visualization-creation.
+
+## Column-probe and `?_tstart` / `?_tend`
+
+`create_visualization` probes columns with `?_tstart`/`?_tend` bound to **now-24h/now**. If no files exist in that window, the probe fails even when `time_range` points at real data.
+
+**Always use `?_tstart`/`?_tend` first** (time-picker-driven). If the call fails with "No resource found", retry **once** with `TO_DATETIME` literals and tell the user the chart is not picker-driven. If one chart needs literals, switch the rest too.
+
+**`BUCKET()` and `?_tstart`/`?_tend` are separate issues.** If both are in a query and it fails, remove `BUCKET` first and retry with `?_tstart`/`?_tend`. `BUCKET` fails only in `create_visualization` (column-probe cannot resolve it). It works in `execute_esql` and `generate_dashboard`. For standalone time series in `create_visualization`, use `DATE_TRUNC` with `data_table` instead.

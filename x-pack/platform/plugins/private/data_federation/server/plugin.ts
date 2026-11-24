@@ -13,16 +13,22 @@ import type {
   PluginInitializerContext,
 } from '@kbn/core/server';
 import type { FeaturesPluginSetup } from '@kbn/features-plugin/server';
+import type { AgentBuilderPluginSetup } from '@kbn/agent-builder-server';
 import type { LicensingPluginStart } from '@kbn/licensing-plugin/server';
 import { License } from '@kbn/license-api-guard-plugin/server';
 import { MINIMUM_LICENSE_TYPE, PLUGIN_ID, PLUGIN_NAME } from '../common';
 import { registerDataSetsRoutes } from './routes/register_routes';
 import { registerUiSettings } from './ui_settings';
+import { dataFederationVisualizationSkill } from './skills/visualization_skill';
 import type { DataFederationConfigType } from './config';
 
+interface DataFederationSetupDeps {
+  features: FeaturesPluginSetup;
+  agentBuilder?: AgentBuilderPluginSetup;
+}
+
 export class DataFederationServerPlugin
-  implements
-    Plugin<void, void, { features: FeaturesPluginSetup }, { licensing: LicensingPluginStart }>
+  implements Plugin<void, void, DataFederationSetupDeps, { licensing: LicensingPluginStart }>
 {
   private readonly config: DataFederationConfigType;
   private readonly logger: Logger;
@@ -37,7 +43,7 @@ export class DataFederationServerPlugin
 
   public setup(
     { http, uiSettings, docLinks }: CoreSetup,
-    { features }: { features: FeaturesPluginSetup }
+    { features, agentBuilder }: DataFederationSetupDeps
   ) {
     if (!this.config.enabled) {
       return;
@@ -60,6 +66,10 @@ export class DataFederationServerPlugin
     });
 
     registerDataSetsRoutes(http.createRouter(), this.license, this.config);
+
+    if (agentBuilder) {
+      agentBuilder.skills.register(dataFederationVisualizationSkill);
+    }
   }
 
   public start(_core: CoreStart, { licensing }: { licensing: LicensingPluginStart }) {

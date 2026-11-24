@@ -1,0 +1,181 @@
+# FDS ES|QL recipes
+
+Copy one recipe into `target.esql` for a standalone chart, or into the
+dashboard panel `esql` field. Replace `<dataset>`, column names, and the
+agreed "no data" predicate. Keep `@timestamp`, `?_tstart`, and `?_tend`.
+
+## probe
+
+Use this to find the latest partition that has data. Not for charts.
+Replace `<start>` and `<end>` with one partition unit (one hour or one day).
+
+```esql
+FROM <dataset>
+| WHERE @timestamp >= TO_DATETIME("<start>") AND @timestamp < TO_DATETIME("<end>")
+| LIMIT 1
+```
+
+If 0 rows, step backward by one partition unit. Try at most 3 windows.
+
+## metric
+
+```esql
+FROM <dataset>
+| KEEP @timestamp
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+| STATS `Total` = COUNT(*)
+```
+
+## metric with a filter
+
+```esql
+FROM <dataset>
+| KEEP @timestamp, action
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+    AND action == "ACCEPT"
+| STATS `Accepted` = COUNT(*)
+```
+
+## xy over time (dashboard and execute_esql)
+
+Use this in `platform.dashboard.generate_dashboard` as the panel `esql`, with
+`chartType: "xy"`. Also use it in `execute_esql` when sampling a time chart.
+Do not use it in `create_visualization`: `BUCKET` fails there. For a
+standalone chart, use the time-series table below.
+
+Say "bar", "area", or "line" in the panel `query` so Lens picks the series.
+A second series (for example bytes) uses the same shape with `SUM`.
+
+```esql
+FROM <dataset>
+| KEEP @timestamp
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+| STATS `Events` = COUNT(*) BY `Time` = BUCKET(@timestamp, 100, ?_tstart, ?_tend)
+```
+
+## xy horizontal bar (dashboard)
+
+Top-N breakdown on a dashboard. `chartType` is `xy`. Say "horizontal bar" in
+the panel `query`. Exclude the agreed "no data" token.
+
+```esql
+FROM <dataset>
+| KEEP @timestamp, action, srcaddr
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+    AND action != "-"
+    AND srcaddr != "-"
+| EVAL `Source IP` = srcaddr
+| STATS `Flows` = COUNT(*) BY `Source IP`
+| SORT `Flows` DESC
+| LIMIT 10
+```
+
+## time-series table (create_visualization only)
+
+Use this only for a standalone chart in `create_visualization`. `BUCKET` fails
+in that tool. Use `data_table` and `DATE_TRUNC`. Do not use this on a
+dashboard; dashboard time series use the xy-over-time recipe.
+Keep `?_tstart` / `?_tend` so the chart responds to the time picker.
+Pick the interval from the window width: `1 minute` for 1h, `5 minutes` for
+multi-hour, `1 hour` for 1 day.
+
+```esql
+FROM <dataset>
+| KEEP @timestamp
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+| EVAL minute = DATE_TRUNC(1 minute, @timestamp)
+| STATS `Events` = COUNT(*) BY minute
+| SORT minute ASC
+| LIMIT 1000
+```
+
+## xy by a category
+
+```esql
+FROM <dataset>
+| KEEP @timestamp, action
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+    AND action != "-"
+| EVAL act = action
+| STATS `Flows` = COUNT(*) BY act
+| SORT `Flows` DESC
+| LIMIT 10
+```
+
+## pie
+
+```esql
+FROM <dataset>
+| KEEP @timestamp, protocol
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+| EVAL proto = CASE(protocol == 6, "TCP", protocol == 17, "UDP", protocol == 1, "ICMP", TO_STRING(protocol))
+| STATS `Flows` = COUNT(*) BY proto
+| SORT `Flows` DESC
+| LIMIT 10
+```
+
+Use `pie` only when the user confirmed the category and it has fewer than
+about 7 values. Otherwise use `xy`.
+
+## data_table
+
+```esql
+FROM <dataset>
+| KEEP @timestamp, srcaddr, dstaddr, action
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+| SORT @timestamp DESC
+| LIMIT 100
+```
+
+## ratio
+
+```esql
+FROM <dataset>
+| KEEP @timestamp, action
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+    AND action IN ("ACCEPT", "REJECT")
+| EVAL rejected = CASE(action == "REJECT", 1, 0)
+| STATS `Reject rate` = ROUND(100.0 * SUM(rejected) / COUNT(*), 2)
+```
+
+The denominator is only the values the user said belong in it. Do not add
+NULL or a placeholder unless they said to.
+
+## sum of a text-format number
+
+Use this when the sample shows the column as `keyword`. A Parquet numeric
+column does not need the cast.
+
+```esql
+FROM <dataset>
+| KEEP @timestamp, bytes
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+    AND bytes != "NA"
+| EVAL b = TO_DOUBLE(bytes)
+| STATS `Bytes` = SUM(b)
+```
+
+## csv sentinel token
+
+`IS NULL` does not match a CSV token unless the dataset sets `null_value`.
+Compare the token the user confirmed.
+
+```esql
+FROM <dataset>
+| KEEP @timestamp, bytes
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+    AND bytes != "NA"
+| STATS `Rows with bytes` = COUNT(bytes)
+```
+
+## dotted field
+
+```esql
+FROM <dataset>
+| KEEP @timestamp, `user.id`
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+| EVAL uid = `user.id`
+| STATS `Events` = COUNT(*) BY uid
+| SORT `Events` DESC
+| LIMIT 10
+```

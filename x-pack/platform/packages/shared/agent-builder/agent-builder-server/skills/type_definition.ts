@@ -34,6 +34,7 @@ export type SkillsDirectoryStructure = Directory<{
       'context-engine': FileDirectory;
       dashboard: FileDirectory;
       discover: FileDirectory;
+      'data-federation': FileDirectory;
       evals: FileDirectory;
       proposals: FileDirectory;
       streams: FileDirectory;

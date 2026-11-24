@@ -242,6 +242,9 @@ export const AGENT_BUILDER_BUILTIN_SKILLS = [
   // Platform – Dashboard
   'dashboards',
 
+  // Platform – ES|QL Data Federation
+  'data-federation-visualization',
+
   // Platform – Discover
   'discover-data-analysis',
   'discover-session',
